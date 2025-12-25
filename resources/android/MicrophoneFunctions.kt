@@ -6,7 +6,6 @@ import android.os.Looper
 import android.util.Log
 import androidx.fragment.app.FragmentActivity
 import com.nativephp.mobile.bridge.BridgeFunction
-import com.nativephp.mobile.utils.NativeActionCoordinator
 
 /**
  * Functions related to microphone recording operations
@@ -14,30 +13,9 @@ import com.nativephp.mobile.utils.NativeActionCoordinator
  */
 object MicrophoneFunctions {
 
+    // Static recorder for synchronous status queries
+    @Volatile
     var microphoneRecorder: MicrophoneRecorder? = null
-    private var isCallbackRegistered = false
-
-    /**
-     * Register the audio permission callback with NativeActionCoordinator
-     * This is called when the microphone recording is started
-     */
-    private fun ensureCallbackRegistered(activity: FragmentActivity, context: Context) {
-        if (!isCallbackRegistered) {
-            val coord = NativeActionCoordinator.install(activity)
-            coord.onAudioPermissionGranted = { id, event ->
-                Log.d("MicrophoneFunctions", "🎤 Audio permission granted callback - id=$id, event=$event")
-
-                // Initialize recorder if needed
-                if (microphoneRecorder == null) {
-                    microphoneRecorder = MicrophoneRecorder(context)
-                }
-
-                microphoneRecorder?.start() ?: false
-            }
-            isCallbackRegistered = true
-            Log.d("MicrophoneFunctions", "✅ Audio permission callback registered")
-        }
-    }
 
     /**
      * Start microphone recording
@@ -56,12 +34,15 @@ object MicrophoneFunctions {
 
             Log.d("MicrophoneFunctions.Start", "🎤 Starting microphone recording with id=$id, event=$event")
 
-            // Ensure callback is registered
-            ensureCallbackRegistered(activity, activity.applicationContext)
-
-            // Delegate to NativeActionCoordinator for permission handling
-            val coord = NativeActionCoordinator.install(activity)
-            coord.launchMicrophoneRecorder(id, event)
+            // Must run on main thread for fragment operations
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    val coordinator = MicrophoneCoordinator.install(activity)
+                    coordinator.launchMicrophoneRecorder(id, event)
+                } catch (e: Exception) {
+                    Log.e("MicrophoneFunctions.Start", "Error: ${e.message}", e)
+                }
+            }
 
             return emptyMap()
         }
@@ -76,35 +57,12 @@ object MicrophoneFunctions {
         override fun execute(parameters: Map<String, Any>): Map<String, Any> {
             Log.d("MicrophoneFunctions.Stop", "⏹️ Stopping microphone recording")
 
-            val path = microphoneRecorder?.stop()
-
-            if (path != null) {
-                // Retrieve stored id and event class from SharedPreferences
-                val prefs = activity.getSharedPreferences("microphone_recording", Context.MODE_PRIVATE)
-                val id = prefs.getString("pending_id", null)
-                val eventClass = prefs.getString("pending_event", null)
-                    ?: "NativePHP\\Microphone\\Events\\MicrophoneRecorded"
-
-                Log.d("MicrophoneFunctions.Stop", "📤 Dispatching $eventClass with path=$path, id=$id")
-
-                // Clean up stored values
-                prefs.edit()
-                    .remove("pending_id")
-                    .remove("pending_event")
-                    .apply()
-
-                // Create payload JSON
-                val payload = org.json.JSONObject().apply {
-                    put("path", path)
-                    put("mimeType", "audio/m4a")
-                    if (id != null) {
-                        put("id", id)
-                    }
-                }
-
-                // Dispatch event directly to Livewire via JavaScript (must be on main thread)
-                Handler(Looper.getMainLooper()).post {
-                    NativeActionCoordinator.dispatchEvent(activity, eventClass, payload.toString())
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    val coordinator = MicrophoneCoordinator.install(activity)
+                    coordinator.stopRecording()
+                } catch (e: Exception) {
+                    Log.e("MicrophoneFunctions.Stop", "Error: ${e.message}", e)
                 }
             }
 
@@ -115,10 +73,19 @@ object MicrophoneFunctions {
     /**
      * Pause microphone recording
      */
-    class Pause : BridgeFunction {
+    class Pause(private val activity: FragmentActivity) : BridgeFunction {
         override fun execute(parameters: Map<String, Any>): Map<String, Any> {
             Log.d("MicrophoneFunctions.Pause", "⏸️ Pausing microphone recording")
-            microphoneRecorder?.pause()
+
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    val coordinator = MicrophoneCoordinator.install(activity)
+                    coordinator.pauseRecording()
+                } catch (e: Exception) {
+                    Log.e("MicrophoneFunctions.Pause", "Error: ${e.message}", e)
+                }
+            }
+
             return emptyMap()
         }
     }
@@ -126,47 +93,56 @@ object MicrophoneFunctions {
     /**
      * Resume microphone recording
      */
-    class Resume : BridgeFunction {
+    class Resume(private val activity: FragmentActivity) : BridgeFunction {
         override fun execute(parameters: Map<String, Any>): Map<String, Any> {
             Log.d("MicrophoneFunctions.Resume", "▶️ Resuming microphone recording")
-            microphoneRecorder?.resume()
+
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    val coordinator = MicrophoneCoordinator.install(activity)
+                    coordinator.resumeRecording()
+                } catch (e: Exception) {
+                    Log.e("MicrophoneFunctions.Resume", "Error: ${e.message}", e)
+                }
+            }
+
             return emptyMap()
         }
     }
 
     /**
-     * Get current recording status
+     * Get current recording status (synchronous - uses static recorder)
      */
-    class GetStatus(private val context: Context) : BridgeFunction {
+    class GetStatus(private val activity: FragmentActivity) : BridgeFunction {
         override fun execute(parameters: Map<String, Any>): Map<String, Any> {
             Log.d("MicrophoneFunctions.GetStatus", "📊 Getting microphone status")
 
-            // Initialize recorder if needed to get consistent status
+            // Initialize recorder if needed (can be done off main thread)
             if (microphoneRecorder == null) {
-                Log.d("MicrophoneFunctions.GetStatus", "🔧 Initializing MicrophoneRecorder")
-                microphoneRecorder = MicrophoneRecorder(context)
+                microphoneRecorder = MicrophoneRecorder(activity.applicationContext, false)
             }
 
             val status = microphoneRecorder?.getStatus() ?: "idle"
             Log.d("MicrophoneFunctions.GetStatus", "📊 Status: $status")
 
-            val result = mapOf("status" to status)
-            Log.d("MicrophoneFunctions.GetStatus", "📤 Returning: $result")
-
-            return result
+            return mapOf("status" to status)
         }
     }
 
     /**
-     * Get path to last recording
+     * Get path to last recording (synchronous - uses static recorder)
      */
-    class GetRecording(private val context: Context) : BridgeFunction {
+    class GetRecording(private val activity: FragmentActivity) : BridgeFunction {
         override fun execute(parameters: Map<String, Any>): Map<String, Any> {
+            Log.d("MicrophoneFunctions.GetRecording", "📁 Getting last recording path")
+
             // Initialize recorder if needed
             if (microphoneRecorder == null) {
-                microphoneRecorder = MicrophoneRecorder(context)
+                microphoneRecorder = MicrophoneRecorder(activity.applicationContext, false)
             }
+
             val path = microphoneRecorder?.getLastRecording()
+
             return if (path != null) {
                 mapOf("path" to path)
             } else {
